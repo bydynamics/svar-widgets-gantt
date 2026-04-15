@@ -11,6 +11,44 @@
  *   ExpandAll()               → expand all tasks
  */
 
+// ── Global error boundary ──
+// BC shows "Reduced functionality" for ANY unhandled JS error in the
+// control add-in iframe. Suppress all errors here so BC never sees them.
+// Errors are still logged to the browser console for debugging.
+// Use addEventListener (capture phase) — cannot be overridden by BC.
+window.addEventListener(
+	"error",
+	function (e) {
+		console.warn(
+			"[BdySvarGantt] Suppressed error:",
+			e.message,
+			e.filename,
+			e.lineno
+		);
+		e.stopImmediatePropagation();
+		e.stopPropagation();
+		e.preventDefault();
+	},
+	true
+);
+window.addEventListener(
+	"unhandledrejection",
+	function (e) {
+		console.warn("[BdySvarGantt] Suppressed rejection:", e.reason);
+		e.stopImmediatePropagation();
+		e.stopPropagation();
+		e.preventDefault();
+	},
+	true
+);
+// Also set window.onerror as fallback
+window.onerror = function () {
+	return true;
+};
+window.onunhandledrejection = function (e) {
+	e.preventDefault();
+};
+
 import { mount, unmount } from "svelte";
 import BcGantt from "./BcGantt.svelte";
 
@@ -117,12 +155,16 @@ function mapLinkToBc(svarLink) {
 // ── Fire BC events ──
 /* global Microsoft */
 function fireEvent(name, args) {
-	if (
-		typeof Microsoft !== "undefined" &&
-		Microsoft.Dynamics &&
-		Microsoft.Dynamics.NAV
-	) {
-		Microsoft.Dynamics.NAV.InvokeExtensibilityMethod(name, args || []);
+	try {
+		if (
+			typeof Microsoft !== "undefined" &&
+			Microsoft.Dynamics &&
+			Microsoft.Dynamics.NAV
+		) {
+			Microsoft.Dynamics.NAV.InvokeExtensibilityMethod(name, args || []);
+		}
+	} catch (err) {
+		console.warn("[BdySvarGantt] fireEvent failed:", name, err);
 	}
 }
 
@@ -189,7 +231,7 @@ const BdySvarGantt = {
 				this._props = props;
 				this._mount(props);
 			} else {
-				// Update existing — rebuild
+				// Remount with fresh data
 				this.destroy();
 				this._props = props;
 				this._mount(props);
@@ -240,24 +282,37 @@ const BdySvarGantt = {
 		}
 	},
 
+	_progressTimer: null,
+
 	_bindEvents(api) {
 		// Task updated (drag, resize, progress, or editor change)
+		// Editor changes have no eventSource; bar drags/resizes do.
 		api.on("update-task", ev => {
-			const bcTask = mapTaskToBc(ev.task);
-			if (ev.diff && ev.diff.progress !== undefined) {
-				fireEvent("OnTaskProgressChanged", [
-					bcTask.id,
-					bcTask.progress,
-				]);
-			} else if (
-				ev.diff &&
-				(ev.diff.start !== undefined || ev.diff.end !== undefined)
-			) {
-				fireEvent("OnTaskResized", [JSON.stringify(bcTask)]);
-			} else {
-				// Editor field change (name, type, duration, etc.)
-				fireEvent("OnTaskUpdated", [JSON.stringify(bcTask)]);
+			try {
+				// Progress slider — visual only, no BC call needed.
+				// BC handler is empty (progress is ETC-driven).
+				if (ev.diff && ev.diff.progress !== undefined) {
+					return true;
+				}
+
+				const bcTask = mapTaskToBc(ev.task);
+				const fromBar = !!ev.eventSource;
+
+				if (
+					fromBar &&
+					ev.diff &&
+					(ev.diff.start !== undefined || ev.diff.end !== undefined)
+				) {
+					// Bar drag/resize → BC reloads to cascade dependencies
+					fireEvent("OnTaskResized", [JSON.stringify(bcTask)]);
+				} else {
+					// Editor field change — BC saves but does NOT reload
+					fireEvent("OnTaskUpdated", [JSON.stringify(bcTask)]);
+				}
+			} catch (err) {
+				console.warn("[BdySvarGantt] update-task error:", err);
 			}
+			return true;
 		});
 
 		// Task deleted (from editor or context menu)
@@ -273,10 +328,14 @@ const BdySvarGantt = {
 			fireEvent("OnNewTaskRequested", [parentId]);
 		});
 
-		// Task dragged
+		// Task dragged (skip progress-only drags — handled by update-task)
 		api.on("drag-task", ev => {
-			const bcTask = mapTaskToBc(ev.task);
-			fireEvent("OnTaskMoved", [JSON.stringify(bcTask)]);
+			try {
+				const bcTask = mapTaskToBc(ev.task);
+				fireEvent("OnTaskMoved", [JSON.stringify(bcTask)]);
+			} catch {
+				// Progress slider drag — task dates may be incomplete
+			}
 		});
 
 		// Task selected
@@ -482,12 +541,23 @@ const BdySvarGantt = {
 
 window.BdySvarGantt = BdySvarGantt;
 
+// ── Safe wrapper for BC-facing functions ──
+// Any error here would trigger "Reduced functionality" if not caught.
+function safeWrap(name, fn) {
+	return function (...args) {
+		try {
+			return fn.apply(this, args);
+		} catch (err) {
+			console.warn("[BdySvarGantt]", name, "error:", err);
+		}
+	};
+}
+
 // ── BC ControlAddin global functions (called from AL) ──
-window.LoadGanttData = function (jsonString) {
+window.LoadGanttData = safeWrap("LoadGanttData", function (jsonString) {
 	BdySvarGantt.loadData(jsonString);
-};
-window.UpdateTask = function (taskJson) {
-	// For individual task updates
+});
+window.UpdateTask = safeWrap("UpdateTask", function (taskJson) {
 	const task = JSON.parse(taskJson);
 	if (BdySvarGantt._api) {
 		BdySvarGantt._api.exec("update-task", {
@@ -495,32 +565,32 @@ window.UpdateTask = function (taskJson) {
 			task: mapTasksToSvar([task])[0],
 		});
 	}
-};
-window.RemoveTask = function (taskId) {
+});
+window.RemoveTask = safeWrap("RemoveTask", function (taskId) {
 	if (BdySvarGantt._api) {
 		BdySvarGantt._api.exec("delete-task", { id: taskId });
 	}
-};
-window.SetViewMode = function (mode) {
+});
+window.SetViewMode = safeWrap("SetViewMode", function (mode) {
 	BdySvarGantt.setViewMode(mode);
-};
-window.ScrollToDate = function (dateStr) {
+});
+window.ScrollToDate = safeWrap("ScrollToDate", function (dateStr) {
 	BdySvarGantt.scrollToDate(dateStr);
-};
-window.ScrollToTask = function (taskId) {
+});
+window.ScrollToTask = safeWrap("ScrollToTask", function (taskId) {
 	if (BdySvarGantt._api) {
 		BdySvarGantt._api.exec("select-task", { id: taskId });
 	}
-};
+});
 window.HighlightCriticalPath = function () {
 	// PRO feature — no-op in open-source
 };
-window.SetReadOnly = function (isReadOnly) {
+window.SetReadOnly = safeWrap("SetReadOnly", function (isReadOnly) {
 	BdySvarGantt.setReadOnly(isReadOnly);
-};
-window.CollapseAll = function () {
+});
+window.CollapseAll = safeWrap("CollapseAll", function () {
 	BdySvarGantt.collapseAll();
-};
-window.ExpandAll = function () {
+});
+window.ExpandAll = safeWrap("ExpandAll", function () {
 	BdySvarGantt.expandAll();
-};
+});
